@@ -5,45 +5,98 @@ from uuid import uuid4, UUID
 from contextlib import contextmanager, asynccontextmanager
 import csv
 
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from httpx import Client, AsyncClient
-from typing import List, Dict, Union, Optional, Any
+from typing import List, Dict, Union, Optional, Any, Callable
 import orjson
 from dotenv import load_dotenv
 from rich.console import Console
+from pydantic import BaseModel, SecretStr, HttpUrl, Field
+from typing import List, Dict, Union, Optional, Set, Any
 
-from .utils import wikipedia_search_lookup
-from .models import ChatMessage, ChatSession
-from .chatgpt import ChatGPTSession
+from utils import wikipedia_search_lookup
+from models import CommonMessage, CommonChatSession
+from chatgpt import ChatGPTSession
 
 load_dotenv()
-
+class ModelSessionFactory:        
+    # @staticmethod
+    # def buildChatGPTSessionConfig(
+    #         ################CommonChatSession common
+    #         auth: Dict[str, SecretStr] = {"api_key": os.getenv("OPENAI_API_KEY")},
+    #         api_url: HttpUrl = "https://api.openai.com/v1/chat/completions",
+    #         model: str = 'gpt-3.5-turbo-16k',
+    #         system: str = "You are a helpful assistant.",
+    #         messages: List[CommonMessage] = [],
+    #         save_messages: Optional[bool] = True,
+    #         title: Optional[str] = None,            
+            
+    #         ################openai ChatGPT
+    #         gpt_role: Optional[str] = 'assistant',
+    #         gpt_name: Optional[str] = 'GPT',
+    #         temperature : Optional[float] = 0.7,
+    #         n: Optional[float] = 1,
+    #         max_tokens: Optional[int] = 1024,
+    #         top_p: Optional[int] = 1,
+    #         presence_penalty : Optional[float] = 0.0,
+    #         frequency_penalty : Optional[float] = 0.0,
+    # ):  
+    #     res = locals()
+    #     res['system_message'] = CommonMessage(role="system", content=res.pop('system'))
+    #     res['params'] = dict(temperature=temperature,top_p=top_p,n=n,max_tokens=max_tokens,presence_penalty=presence_penalty,frequency_penalty=frequency_penalty)        
+    #     return lambda:res
+    
+    @staticmethod
+    def buildChatGPTSession(
+        ################CommonChatSession common
+        auth: Dict[str, SecretStr] = {"api_key": os.getenv("OPENAI_API_KEY")},
+        api_url: HttpUrl = "https://api.openai.com/v1/chat/completions",
+        model: str = 'gpt-3.5-turbo-16k',
+        system: str = "You are a helpful assistant.",
+        messages: List[CommonMessage] = [],
+        save_messages: Optional[bool] = True,
+        title: Optional[str] = None,
+        
+        ################openai ChatGPT
+        gpt_role: Optional[str] = 'assistant',
+        gpt_name: Optional[str] = 'GPT',
+        temperature : Optional[float] = 0.7,
+        n: Optional[float] = 1,
+        max_tokens: Optional[int] = 1024,
+        top_p: Optional[int] = 1,
+        presence_penalty : Optional[float] = 0.0,
+        frequency_penalty : Optional[float] = 0.0,
+    ):  
+        res = locals()
+        res['system_message'] = CommonMessage(role="system", content=res.pop('system'))
+        res['params'] = dict(temperature=temperature,top_p=top_p,n=n,max_tokens=max_tokens,presence_penalty=presence_penalty,frequency_penalty=frequency_penalty)        
+        return ChatGPTSession(**res)
 
 class AIChat(BaseModel):
     client: Any
-    default_session: Optional[ChatSession]
-    sessions: Dict[Union[str, UUID], ChatSession] = {}
+    default_session: Optional[CommonChatSession]
+    sessions: Dict[Union[str, UUID], CommonChatSession] = {}
 
     def __init__(
         self,
-        character: str = None,
-        character_command: str = None,
-        system: str = None,
-        id: Union[str, UUID] = uuid4(),
-        prime: bool = True,
+        # character: str = None,
+        # character_command: str = None,
+        # system: str = None,
+        # id: Union[str, UUID] = uuid4(),
+        # prime: bool = True,
         default_session: bool = True,
-        console: bool = True,
-        **kwargs,
+        # console: bool = True,
+        model_session_config_func: Callable = lambda:dict(),
     ):
 
         client = Client(proxies=os.getenv("https_proxy"))
-        system_format = self.build_system(character, character_command, system)
+        # system_format = self.build_system(character, character_command, system)
 
         sessions = {}
         new_default_session = None
         if default_session:
             new_session = self.new_session(
-                return_session=True, system=system_format, id=id, **kwargs
+                return_session=True, model_session_config_func=model_session_config_func
             )
 
             new_default_session = new_session
@@ -53,36 +106,35 @@ class AIChat(BaseModel):
             client=client, default_session=new_default_session, sessions=sessions
         )
 
-        if not system and console:
-            character = "ChatGPT" if not character else character
-            new_default_session.title = character
-            self.interactive_console(character=character, prime=prime)
+        # if console:
+        #     character = "ChatGPT" if not character else character
+        #     new_default_session.title = character
+        #     self.interactive_console(character=character, prime=prime)
 
     def new_session(
         self,
         return_session: bool = False,
-        **kwargs,
+        model_session_config_func: Callable = lambda:dict(),
     ) -> Optional[ChatGPTSession]:
-
-        if "model" not in kwargs:  # set default
-            kwargs["model"] = "gpt-3.5-turbo"
+        kwargs = model_session_config_func()
+        print(kwargs)
         # TODO: Add support for more models (PaLM, Claude)
         if "gpt-" in kwargs["model"]:
             gpt_api_key = kwargs.get("api_key") or os.getenv("OPENAI_API_KEY")
             assert gpt_api_key, f"An API key for {kwargs['model'] } was not defined."
-            sess = ChatGPTSession(
-                auth={
-                    "api_key": gpt_api_key,
-                },
-                **kwargs,
-            )
-
+            sess = ChatGPTSession(**kwargs,)
         if return_session:
             return sess
         else:
             self.sessions[sess.id] = sess
 
-    def get_session(self, id: Union[str, UUID] = None) -> ChatSession:
+    def get_first_session(self) -> CommonChatSession:
+        return self.get_session(list(self.sessions.keys()).pop())
+
+    def get_session_by_uuid(self, id: str) -> CommonChatSession:
+        return self.get_session(UUID(id))
+
+    def get_session(self, id: Union[str, UUID] = None) -> CommonChatSession:
         try:
             sess = self.sessions[id] if id else self.default_session
         except KeyError:
@@ -103,14 +155,14 @@ class AIChat(BaseModel):
         del self.sessions[sess.id]
         del sess
 
-    @contextmanager
-    def session(self, **kwargs):
-        sess = self.new_session(return_session=True, **kwargs)
-        self.sessions[sess.id] = sess
-        try:
-            yield sess
-        finally:
-            self.delete_session(sess.id)
+    # @contextmanager
+    # def session(self, **kwargs):
+    #     sess = self.new_session(return_session=True, **kwargs)
+    #     self.sessions[sess.id] = sess
+    #     try:
+    #         yield sess
+    #     finally:
+    #         self.delete_session(sess.id)
 
     def __call__(
         self,
@@ -147,7 +199,7 @@ class AIChat(BaseModel):
                 output_schema=output_schema,
             )
 
-    def stream(
+    def stream_chat(
         self,
         prompt: str,
         id: Union[str, UUID] = None,
@@ -157,7 +209,7 @@ class AIChat(BaseModel):
         input_schema: Any = None,
     ) -> str:
         sess = self.get_session(id)
-        return sess.stream(
+        return sess.stream_chat(
             prompt,
             client=self.client,
             system=system,
@@ -165,31 +217,6 @@ class AIChat(BaseModel):
             params=params,
             input_schema=input_schema,
         )
-
-    def build_system(
-        self, character: str = None, character_command: str = None, system: str = None
-    ) -> str:
-        default = "You are a helpful assistant."
-        if character:
-            character_prompt = """
-            You must follow ALL these rules in all responses:
-            - You are the following character and should ALWAYS act as them: {0}
-            - NEVER speak in a formal tone.
-            - Concisely introduce yourself first in character.
-            """
-            prompt = character_prompt.format(wikipedia_search_lookup(character)).strip()
-            if character_command:
-                character_system = """
-                - {0}
-                """
-                prompt = (
-                    prompt + "\n" + character_system.format(character_command).strip()
-                )
-            return prompt
-        elif system:
-            return system
-        else:
-            return default
 
     def interactive_console(self, character: str = None, prime: bool = True) -> None:
         console = Console(highlight=False, force_jupyter=False)
@@ -235,38 +262,9 @@ class AIChat(BaseModel):
         minify: bool = False,
     ):
         sess = self.get_session(id)
-        sess_dict = sess.model_dump(
-            exclude={"auth", "api_url", "input_fields"},
-            exclude_none=True,
-        )
-        output_path = output_path or f"chat_session.{format}"
-        if format == "csv":
-            with open(output_path, "w", encoding="utf-8") as f:
-                fields = [
-                    "role",
-                    "content",
-                    "received_at",
-                    "prompt_length",
-                    "completion_length",
-                    "total_length",
-                ]
-                w = csv.DictWriter(f, fieldnames=fields)
-                w.writeheader()
-                for message in sess_dict["messages"]:
-                    # datetime must be in common format to be loaded into spreadsheet
-                    # for human-readability, the timezone is set to local machine
-                    local_datetime = message["received_at"].astimezone()
-                    message["received_at"] = local_datetime.strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-                    w.writerow(message)
-        elif format == "json":
-            with open(output_path, "wb") as f:
-                f.write(
-                    orjson.dumps(
-                        sess_dict, option=orjson.OPT_INDENT_2 if not minify else None
-                    )
-                )
+        sess.save_session(output_path=output_path,
+                          format=format,
+                          minify=minify,)
 
     def load_session(self, input_path: str, id: Union[str, UUID] = uuid4(), **kwargs):
 
@@ -281,14 +279,14 @@ class AIChat(BaseModel):
                 for row in r:
                     # need to convert the datetime back to UTC
                     local_datetime = datetime.datetime.strptime(
-                        row["received_at"], "%Y-%m-%d %H:%M:%S"
+                        row["last_update"], "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=dateutil.tz.tzlocal())
-                    row["received_at"] = local_datetime.astimezone(
+                    row["last_update"] = local_datetime.astimezone(
                         datetime.timezone.utc
                     )
                     # https://stackoverflow.com/a/68305271
                     row = {k: (None if v == "" else v) for k, v in row.items()}
-                    messages.append(ChatMessage(**row))
+                    messages.append(CommonMessage(**row))
 
             self.new_session(id=id, **kwargs)
             self.sessions[id].messages = messages

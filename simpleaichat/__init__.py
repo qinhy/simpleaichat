@@ -1,1 +1,1 @@
-from .simpleaichat import AIChat, AsyncAIChat
+from .simpleaichat import AIChat, AsyncAIChat, ModelSessionConfigFactory

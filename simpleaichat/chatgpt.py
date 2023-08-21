@@ -1,401 +1,245 @@
-from pydantic import HttpUrl
+from pydantic import BaseModel, SecretStr, HttpUrl, Field
 from httpx import Client, AsyncClient
 from typing import List, Dict, Union, Set, Any
 import orjson
+import os
+from uuid import uuid4, UUID
+import openai
+from models import CommonMessage, CommonChatSession, Function
+from utils import remove_a_key
+import json
+from typing import List, Dict, Union, Optional, Set, Any
+import tiktoken
+from utils import wikipedia_search, wikipedia_search_lookup
 
-from .models import ChatMessage, ChatSession
-from .utils import remove_a_key
+class WikipediaSearch(Function):
+    description: str = 'search information from wiki and get topics'
+    _parameters_description = dict(
+        query='the key words use for searching'
+    )
+    def __call__(self, query: str):
+        wiki_matches = wikipedia_search(query, n=3)
+        if len(wiki_matches)==0:
+            wiki_matches = ['nothing found!']
+        return {"titles": wiki_matches, "context": ", ".join(wiki_matches), }
+    
+    def __init__(self, *args,**kwargs):
+        super(self.__class__, self).__init__(*args,**kwargs)
+        self._extract_signature()
 
-tool_prompt = """From the list of tools below:
-- Reply ONLY with the number of the tool appropriate in response to the user's last message.
-- If no tool is appropriate, ONLY reply with \"0\".
+class WikipediaLookup(Function):
+    description: str = 'lookup more information about a topic.'
+    _parameters_description = dict(
+        query='the key words use for lookup'
+    )
+    def __call__(self, query: str):
+        page = wikipedia_search_lookup(query, sentences=3)
+        return page
+    
+    def __init__(self, *args,**kwargs):
+        super(self.__class__, self).__init__(*args,**kwargs)
+        self._extract_signature()
 
-{tools}"""
+class PromptFactory:
+    @staticmethod
+    def function_use(gpt_name: str = '', function_name: str = '') -> str:
+        return f"\n{gpt_name} is using {function_name} with args: \n"
 
+    @staticmethod
+    def function_res(function_name: str = '', args: str = '', res: str = '') -> str:
+        return f"\n{function_name} ( {args} ) ==> {res}\n"
+    
+    @staticmethod
+    def japanese_system(name='assistant') -> str:
+        return f"You are a helpful {name} who is proficient in both English and Japanese. Please ensure that all your replies are in Japanese, except for computer commands."
 
-class ChatGPTSession(ChatSession):
+class ChatGPTSession(CommonChatSession):    
+    ################ openai config
+    temperature : Optional[float] = 0.7
+    n: Optional[float] = 1
+    max_tokens: Optional[int] = 1024
+    top_p: Optional[int] = 1
+    presence_penalty : Optional[float] = 0.0
+    frequency_penalty : Optional[float] = 0.0
+    gpt_role: Optional[str] = 'assistant'
+    gpt_name: Optional[str] = 'GPT'
+    
+    ################CommonChatSession
+    # id: Union[str, UUID] = Field(default_factory=uuid4)
+    # created_at: datetime.datetime = Field(default_factory=now_tz)
+    auth: Dict[str, SecretStr] = {"api_key": os.getenv("OPENAI_API_KEY")}
     api_url: HttpUrl = "https://api.openai.com/v1/chat/completions"
+    model: str = 'gpt-3.5-turbo-16k'     
+    params: Dict[str, Any] = dict(temperature =temperature ,top_p=top_p,n=n,max_tokens=max_tokens,presence_penalty=presence_penalty,frequency_penalty=frequency_penalty)
+    system_message: CommonMessage = None
+    messages: List[CommonMessage] = []
     input_fields: Set[str] = {"role", "content", "name"}
-    system: str = "You are a helpful assistant."
-    params: Dict[str, Any] = {"temperature": 0.7}
+    # recent_messages: Optional[int] = None
+    save_messages: Optional[bool] = True
+    # total_prompt_length: int = 0
+    # total_completion_length: int = 0
+    # total_length: int = 0
+    title: Optional[str] = None
 
-    def prepare_request(
-        self,
-        prompt: str,
-        system: str = None,
-        params: Dict[str, Any] = None,
-        stream: bool = False,
-        input_schema: Any = None,
-        output_schema: Any = None,
-        is_function_calling_required: bool = True,
-    ):
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.auth['api_key'].get_secret_value()}",
-        }
+    ############################# internal ##############################    
+    _last_prompt:str = None
+    _last_receive:str = None
 
-        system_message = ChatMessage(role="system", content=system or self.system)
-        if not input_schema:
-            user_message = ChatMessage(role="user", content=prompt)
+    def __init__(self, *args,**kwargs):
+        super(self.__class__, self).__init__(*args,**kwargs)
+
+        self._token_encoder = lambda:tiktoken.encoding_for_model(self.model.replace('-16k',''))
+        if self.system_message is None:
+            self.system_message = CommonMessage(role="system", content=f'You are a helpful {self.gpt_role}.').calc_tokens(self._token_encoder())
+
+    def __call__(self,prompt: Union[str, Any], user_name:Optional[str]=None
+                 , tools:Optional[List[Any]]=None, stream:bool=False) -> str:
+        self.add_msg({'user':prompt},user_name)
+        if tools is None:
+            for r in self._gen() if not stream else self._stream_gen():yield r  
         else:
-            assert isinstance(
-                prompt, input_schema
-            ), f"prompt must be an instance of {input_schema.__name__}"
-            user_message = ChatMessage(
-                role="function",
-                content=prompt.model_dump_json(),
-                name=input_schema.__name__,
-            )
+            for r in self._gen_with_tools(tools) if not stream else self._stream_gen_with_tools(tools):yield r
 
-        gen_params = params or self.params
-        data = {
-            "model": self.model,
-            "messages": self.format_input_messages(system_message, user_message),
-            "stream": stream,
-            **gen_params,
-        }
-
-        # Add function calling parameters if a schema is provided
-        if input_schema or output_schema:
-            functions = []
-            if input_schema:
-                input_function = self.schema_to_function(input_schema)
-                functions.append(input_function)
-            if output_schema:
-                output_function = self.schema_to_function(output_schema)
-                functions.append(
-                    output_function
-                ) if output_function not in functions else None
-                if is_function_calling_required:
-                    data["function_call"] = {"name": output_schema.__name__}
-            data["functions"] = functions
-
-        return headers, data, user_message
-
-    def schema_to_function(self, schema: Any):
-        assert schema.__doc__, f"{schema.__name__} is missing a docstring."
-        assert (
-            "title" not in schema.__fields__.keys()
-        ), "`title` is a reserved keyword and cannot be used as a field name."
-        schema_dict = schema.model_json_schema()
-        remove_a_key(schema_dict, "title")
-
-        return {
-            "name": schema.__name__,
-            "description": schema.__doc__,
-            "parameters": schema_dict,
-        }
-
-    def gen(
-        self,
-        prompt: str,
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-        input_schema: Any = None,
-        output_schema: Any = None,
-    ):
-        headers, data, user_message = self.prepare_request(
-            prompt, system, params, False, input_schema, output_schema
-        )
-
-        r = client.post(
-            str(self.api_url),
-            json=data,
-            headers=headers,
-            timeout=None,
-        )
-        r = r.json()
-
+    def add_msg(self,m = {'user':'Hello!'}, name=None):
         try:
-            if not output_schema:
-                content = r["choices"][0]["message"]["content"]
-                assistant_message = ChatMessage(
-                    role=r["choices"][0]["message"]["role"],
-                    content=content,
-                    finish_reason=r["choices"][0]["finish_reason"],
-                    prompt_length=r["usage"]["prompt_tokens"],
-                    completion_length=r["usage"]["completion_tokens"],
-                    total_length=r["usage"]["total_tokens"],
-                )
-                self.add_messages(user_message, assistant_message, save_messages)
-            else:
-                content = r["choices"][0]["message"]["function_call"]["arguments"]
-                content = orjson.loads(content)
-
+            if type(m) is not CommonMessage:
+                m = CommonMessage.custom_construct_one(m).calc_tokens(self._token_encoder())
+        except Exception as e:
+            print(e)
+            return False
+        if name is not None:
+            m.name = name
+        self.messages.append(m)
+        return True
+    
+    def get_messages_dict(self):
+        model_dump = lambda x:x.model_dump(include=self.input_fields, exclude_none=True)
+        msg = [model_dump(self.system_message)]
+        msg += [model_dump(m) for m in self.messages[-self.recent_messages:] ]
+        return msg
+    
+    def _process_response(self,r):
+        try:
+            msg = r["choices"][0]["message"]
+            content = msg['content']
+            if "name" in msg.keys():
+                self.gpt_name = msg['name']
+            self.add_msg({msg['role']:content},self.gpt_name)                
             self.total_prompt_length += r["usage"]["prompt_tokens"]
             self.total_completion_length += r["usage"]["completion_tokens"]
             self.total_length += r["usage"]["total_tokens"]
         except KeyError:
             raise KeyError(f"No AI generation: {r}")
-
         return content
 
-    def stream(
-        self,
-        prompt: str,
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-        input_schema: Any = None,
-    ):
-        headers, data, user_message = self.prepare_request(
-            prompt, system, params, True, input_schema
-        )
-
-        with client.stream(
-            "POST",
-            str(self.api_url),
-            json=data,
-            headers=headers,
-            timeout=None,
-        ) as r:
-            content = []
-            for chunk in r.iter_lines():
-                if len(chunk) > 0:
-                    chunk = chunk[6:]  # SSE JSON chunks are prepended with "data: "
-                    if chunk != "[DONE]":
-                        chunk_dict = orjson.loads(chunk)
-                        delta = chunk_dict["choices"][0]["delta"].get("content")
-                        if delta:
-                            content.append(delta)
-                            yield {"delta": delta, "response": "".join(content)}
-
-        # streaming does not currently return token counts
-        assistant_message = ChatMessage(
-            role="assistant",
-            content="".join(content),
-        )
-
-        self.add_messages(user_message, assistant_message, save_messages)
-
-        return assistant_message
-
-    def gen_with_tools(
-        self,
-        prompt: str,
-        tools: List[Any],
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-    ) -> Dict[str, Any]:
-
-        # call 1: select tool and populate context
-        tools_list = "\n".join(f"{i+1}: {f.__doc__}" for i, f in enumerate(tools))
-        tool_prompt_format = tool_prompt.format(tools=tools_list)
-
-        logit_bias_weight = 100
-        logit_bias = {str(k): logit_bias_weight for k in range(15, 15 + len(tools) + 1)}
-
-        tool_idx = int(
-            self.gen(
-                prompt,
-                client=client,
-                system=tool_prompt_format,
-                save_messages=False,
-                params={
-                    "temperature": 0.0,
-                    "max_tokens": 1,
-                    "logit_bias": logit_bias,
-                },
-            )
-        )
-
-        # if no tool is selected, do a standard generation instead.
-        if tool_idx == 0:
-            return {
-                "response": self.gen(
-                    prompt,
-                    client=client,
-                    system=system,
-                    save_messages=save_messages,
-                    params=params,
-                ),
-                "tool": None,
-            }
-        selected_tool = tools[tool_idx - 1]
-        context_dict = selected_tool(prompt)
-        if isinstance(context_dict, str):
-            context_dict = {"context": context_dict}
-
-        context_dict["tool"] = selected_tool.__name__
-
-        # call 2: generate from the context
-        new_system = f"{system or self.system}\n\nYou MUST use information from the context in your response."
-        new_prompt = f"Context: {context_dict['context']}\n\nUser: {prompt}"
-
-        context_dict["response"] = self.gen(
-            new_prompt,
-            client=client,
-            system=new_system,
-            save_messages=False,
-            params=params,
-        )
-
-        # manually append the nonmodified user message + normal AI response
-        user_message = ChatMessage(role="user", content=prompt)
-        assistant_message = ChatMessage(
-            role="assistant", content=context_dict["response"]
-        )
-        self.add_messages(user_message, assistant_message, save_messages)
-
-        return context_dict
-
-    async def gen_async(
-        self,
-        prompt: str,
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-        input_schema: Any = None,
-        output_schema: Any = None,
-    ):
-        headers, data, user_message = self.prepare_request(
-            prompt, system, params, False, input_schema, output_schema
-        )
-
-        r = await client.post(
-            str(self.api_url),
-            json=data,
-            headers=headers,
-            timeout=None,
-        )
-        r = r.json()
-
+    def _process_stream_response(self,r):
         try:
-            if not output_schema:
-                content = r["choices"][0]["message"]["content"]
-                assistant_message = ChatMessage(
-                    role=r["choices"][0]["message"]["role"],
-                    content=content,
-                    finish_reason=r["choices"][0]["finish_reason"],
-                    prompt_length=r["usage"]["prompt_tokens"],
-                    completion_length=r["usage"]["completion_tokens"],
-                    total_length=r["usage"]["total_tokens"],
-                )
-                self.add_messages(user_message, assistant_message, save_messages)
+            funcname = ''
+            arguments = ''
+            content = []
+            for chunk in r:
+                msg = chunk["choices"][0]["delta"]
+                if 'function_call' in msg.keys():
+                    msg = msg['function_call']
+                    if 'name' in msg.keys():
+                        funcname = msg['name']
+                        for r in PromptFactory.function_use(self.gpt_name,msg['name']).split(' '):yield r+' '
+                    if 'arguments' in msg.keys():
+                        arguments += msg['arguments']
+                        yield msg['arguments']
+                else:
+                    delta = msg.get("content")
+                    if delta:
+                        content.append(delta)
+                        yield content[-1]#{"delta": delta, "response": "".join(content)}
+            if len(content)>0:
+                self.add_msg({self.gpt_role:"".join(content)},self.gpt_name)
+                yield  "".join(content)
             else:
-                content = r["choices"][0]["message"]["function_call"]["arguments"]
-                content = orjson.loads(content)
-
-            self.total_prompt_length += r["usage"]["prompt_tokens"]
-            self.total_completion_length += r["usage"]["completion_tokens"]
-            self.total_length += r["usage"]["total_tokens"]
+                yield funcname,arguments
         except KeyError:
             raise KeyError(f"No AI generation: {r}")
+        
+    def openai_chat_completion_create(self,stream=False,tools_prompt=None,timeout=None):
+        openai.api_key = self.auth['api_key'].get_secret_value()
+        if tools_prompt is None:
+            return openai.ChatCompletion.create(model=self.model,
+                                                **self.params,stream=stream,
+                                                messages=self.get_messages_dict(),
+                                                timeout=timeout)
+        else:
+            return openai.ChatCompletion.create(model=self.model,
+                                                **self.params,stream=stream,
+                                                messages=self.get_messages_dict(),
+                                                functions=[t[1] for t in tools_prompt.values()],
+                                                function_call="auto",
+                                                timeout=timeout)
 
-        return content
 
-    async def stream_async(
-        self,
-        prompt: str,
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-        input_schema: Any = None,
-    ):
-        headers, data, user_message = self.prepare_request(
-            prompt, system, params, True, input_schema
-        )
+    def _gen(self,timeout=None):        
+        response = self.openai_chat_completion_create(stream=False,timeout=timeout)
+        self._last_receive = response    
+        yield self._process_response(response)
+    
+    
+    def _gen_with_tools(self,tools: List[Any],):
+        tools_prompt = {t.__class__.__name__:(t,t.model_dump()) for t in tools}
+        self._last_receive = response = self.openai_chat_completion_create(stream=False,tools_prompt=tools_prompt)
+        msg = response['choices'][0]["message"]
+        if 'function_call' in msg.keys():
+            yield PromptFactory.function_use(self.gpt_name,msg['function_call']['name'])
+            func = tools_prompt.get(msg['function_call']['name'],(None,None))[0]
+            args = json.loads(msg['function_call']['arguments'])
+            if func is not None:
+                res = func(**args)
+                yield PromptFactory.function_res(msg['function_call']['name'],args,res)
+                self.add_msg({'function':str(res)},msg['function_call']['name'])
+                for r in self._gen() :yield r
+        yield  ''
 
-        async with client.stream(
-            "POST",
-            str(self.api_url),
-            json=data,
-            headers=headers,
-            timeout=None,
-        ) as r:
-            content = []
-            async for chunk in r.aiter_lines():
-                if len(chunk) > 0:
-                    chunk = chunk[6:]  # SSE JSON chunks are prepended with "data: "
-                    if chunk != "[DONE]":
-                        chunk_dict = orjson.loads(chunk)
-                        delta = chunk_dict["choices"][0]["delta"].get("content")
-                        if delta:
-                            content.append(delta)
-                            yield {"delta": delta, "response": "".join(content)}
+    def _stream_gen(self,timeout=None):
+        response = self.openai_chat_completion_create(stream=True,timeout=timeout)
+        for r in self._process_stream_response(response):
+            self._last_receive = r
+            if type(r) is tuple and len(r)==2:continue
+            yield r
 
-        # streaming does not currently return token counts
-        assistant_message = ChatMessage(
-            role="assistant",
-            content="".join(content),
-        )
-
-        self.add_messages(user_message, assistant_message, save_messages)
-
-    async def gen_with_tools_async(
-        self,
-        prompt: str,
-        tools: List[Any],
-        client: Union[Client, AsyncClient],
-        system: str = None,
-        save_messages: bool = None,
-        params: Dict[str, Any] = None,
-    ) -> Dict[str, Any]:
-
-        # call 1: select tool and populate context
-        tools_list = "\n".join(f"{i+1}: {f.__doc__}" for i, f in enumerate(tools))
-        tool_prompt_format = tool_prompt.format(tools=tools_list)
-
-        logit_bias_weight = 100
-        logit_bias = {str(k): logit_bias_weight for k in range(15, 15 + len(tools) + 1)}
-
-        tool_idx = int(
-            await self.gen_async(
-                prompt,
-                client=client,
-                system=tool_prompt_format,
-                save_messages=False,
-                params={
-                    "temperature": 0.0,
-                    "max_tokens": 1,
-                    "logit_bias": logit_bias,
-                },
-            )
-        )
-
-        # if no tool is selected, do a standard generation instead.
-        if tool_idx == 0:
-            return {
-                "response": await self.gen_async(
-                    prompt,
-                    client=client,
-                    system=system,
-                    save_messages=save_messages,
-                    params=params,
-                ),
-                "tool": None,
-            }
-        selected_tool = tools[tool_idx - 1]
-        context_dict = await selected_tool(prompt)
-        if isinstance(context_dict, str):
-            context_dict = {"context": context_dict}
-
-        context_dict["tool"] = selected_tool.__name__
-
-        # call 2: generate from the context
-        new_system = f"{system or self.system}\n\nYou MUST use information from the context in your response."
-        new_prompt = f"Context: {context_dict['context']}\n\nUser: {prompt}"
-
-        context_dict["response"] = await self.gen_async(
-            new_prompt,
-            client=client,
-            system=new_system,
-            save_messages=False,
-            params=params,
-        )
-
-        # manually append the nonmodified user message + normal AI response
-        user_message = ChatMessage(role="user", content=prompt)
-        assistant_message = ChatMessage(
-            role="assistant", content=context_dict["response"]
-        )
-        self.add_messages(user_message, assistant_message, save_messages)
-
-        return context_dict
+    def _stream_gen_with_tools(self,tools: List[Any],):
+        tools_prompt = {t.__class__.__name__:(t,t.model_dump()) for t in tools}
+        response = self.openai_chat_completion_create(stream=True,tools_prompt=tools_prompt)
+        for r in self._process_stream_response(response):            
+            self._last_receive = r
+            if type(r) is tuple and len(r)==2:
+                funcname,arguments = r
+                func = tools_prompt.get(funcname,(None,None))[0]
+                args = json.loads(arguments)
+                if func is not None:
+                    res = func(**args)
+                    for r in PromptFactory.function_res(funcname,args,res).split(' '):yield r+' '
+                    self.add_msg({'function':str(res)},funcname)
+                    for r in self._stream_gen() :yield r
+            else:
+                yield r
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            

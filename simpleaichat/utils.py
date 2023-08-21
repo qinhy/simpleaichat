@@ -16,7 +16,6 @@ def wikipedia_search(query: str, n: int = 1) -> Union[str, List[str]]:
         "srwhat": "text",
         "srprop": "",
     }
-
     r_search = httpx.get(WIKIPEDIA_API_URL, params=SEARCH_PARAMS)
     results = [x["title"] for x in r_search.json()["query"]["search"]]
 
