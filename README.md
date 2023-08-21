@@ -1,4 +1,4 @@
-# simpleaichat
+# simpleaichat (fork)
 
 ```py3
 from simpleaichat import AIChat
