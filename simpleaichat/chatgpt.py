@@ -1,7 +1,5 @@
 from pydantic import BaseModel, SecretStr, HttpUrl, Field
-from httpx import Client, AsyncClient
 from typing import List, Dict, Union, Set, Any
-import orjson
 import os
 from uuid import uuid4, UUID
 import openai
@@ -53,6 +51,21 @@ class PromptFactory:
     def japanese_system(name='assistant') -> str:
         return f"You are a helpful {name} who is proficient in both English and Japanese. Please ensure that all your replies are in Japanese, except for computer commands."
 
+    @staticmethod
+    def QnA(q,a):
+        return f'''
+You are an expert who conducts strict evaluations. For the given Question and Answer, determine whether the response is adequate. 
+If it's sufficient, simply only 'OK'.
+If it's not, please provide appropriate advice.
+
+Question:
+{q}
+
+Answer:
+{a}
+'''
+
+
 class ChatGPTSession(CommonChatSession):    
     ################ openai config
     temperature : Optional[float] = 0.7
@@ -67,30 +80,27 @@ class ChatGPTSession(CommonChatSession):
     ################CommonChatSession
     # id: Union[str, UUID] = Field(default_factory=uuid4)
     # created_at: datetime.datetime = Field(default_factory=now_tz)
-    auth: Dict[str, SecretStr] = {"api_key": os.getenv("OPENAI_API_KEY")}
+    auth: Dict[str, SecretStr] = {"api_key": SecretStr('NULL')}
     api_url: HttpUrl = "https://api.openai.com/v1/chat/completions"
     model: str = 'gpt-3.5-turbo-16k'     
-    params: Dict[str, Any] = dict(temperature =temperature ,top_p=top_p,n=n,max_tokens=max_tokens,presence_penalty=presence_penalty,frequency_penalty=frequency_penalty)
     system_message: CommonMessage = None
     messages: List[CommonMessage] = []
-    input_fields: Set[str] = {"role", "content", "name"}
     # recent_messages: Optional[int] = None
-    save_messages: Optional[bool] = True
     # total_prompt_length: int = 0
     # total_completion_length: int = 0
     # total_length: int = 0
     title: Optional[str] = None
 
     ############################# internal ##############################    
+    _params: Dict[str, Any] = dict(temperature =temperature ,top_p=top_p,n=n,max_tokens=max_tokens,presence_penalty=presence_penalty,frequency_penalty=frequency_penalty)
     _last_prompt:str = None
     _last_receive:str = None
 
     def __init__(self, *args,**kwargs):
         super(self.__class__, self).__init__(*args,**kwargs)
 
-        self._token_encoder = lambda:tiktoken.encoding_for_model(self.model.replace('-16k',''))
         if self.system_message is None:
-            self.system_message = CommonMessage(role="system", content=f'You are a helpful {self.gpt_role}.').calc_tokens(self._token_encoder())
+            self.system_message = CommonMessage(role="system", content=f'You are a helpful {self.gpt_role}.').calc_tokens(self.get_token_encoder())
 
     def __call__(self,prompt: Union[str, Any], user_name:Optional[str]=None
                  , tools:Optional[List[Any]]=None, stream:bool=False) -> str:
@@ -99,21 +109,15 @@ class ChatGPTSession(CommonChatSession):
             for r in self._gen() if not stream else self._stream_gen():yield r  
         else:
             for r in self._gen_with_tools(tools) if not stream else self._stream_gen_with_tools(tools):yield r
-
-    def add_msg(self,m = {'user':'Hello!'}, name=None):
-        try:
-            if type(m) is not CommonMessage:
-                m = CommonMessage.custom_construct_one(m).calc_tokens(self._token_encoder())
-        except Exception as e:
-            print(e)
-            return False
-        if name is not None:
-            m.name = name
-        self.messages.append(m)
-        return True
     
-    def get_messages_dict(self):
-        model_dump = lambda x:x.model_dump(include=self.input_fields, exclude_none=True)
+    def get_token_encoder(self):
+        try:
+            return tiktoken.encoding_for_model(self.model.replace('-16k',''))
+        except Exception as e:
+            return None
+        
+    def get_messages_dict(self,fields: Set[str] = {"role", "content", "name"}):
+        model_dump = lambda x:x.model_dump(include=fields, exclude_none=True)
         msg = [model_dump(self.system_message)]
         msg += [model_dump(m) for m in self.messages[-self.recent_messages:] ]
         return msg
@@ -160,18 +164,18 @@ class ChatGPTSession(CommonChatSession):
         except KeyError:
             raise KeyError(f"No AI generation: {r}")
         
-    def openai_chat_completion_create(self,stream=False,tools_prompt=None,timeout=None):
+    def openai_chat_completion_create(self,stream=False,tools_description=None,timeout=None):
         openai.api_key = self.auth['api_key'].get_secret_value()
-        if tools_prompt is None:
+        if tools_description is None:
             return openai.ChatCompletion.create(model=self.model,
-                                                **self.params,stream=stream,
+                                                **self._params,stream=stream,
                                                 messages=self.get_messages_dict(),
                                                 timeout=timeout)
         else:
             return openai.ChatCompletion.create(model=self.model,
-                                                **self.params,stream=stream,
+                                                **self._params,stream=stream,
                                                 messages=self.get_messages_dict(),
-                                                functions=[t[1] for t in tools_prompt.values()],
+                                                functions=tools_description,
                                                 function_call="auto",
                                                 timeout=timeout)
 
@@ -183,8 +187,9 @@ class ChatGPTSession(CommonChatSession):
     
     
     def _gen_with_tools(self,tools: List[Any],):
-        tools_prompt = {t.__class__.__name__:(t,t.model_dump()) for t in tools}
-        self._last_receive = response = self.openai_chat_completion_create(stream=False,tools_prompt=tools_prompt)
+        tools_prompt = {t.get_class_name():(t,t.get_openai_description()) for t in tools}
+        self._last_receive = response = self.openai_chat_completion_create(stream=False,
+                                                      tools_prompt=[t[1] for t in tools_prompt.values()])
         msg = response['choices'][0]["message"]
         if 'function_call' in msg.keys():
             yield PromptFactory.function_use(self.gpt_name,msg['function_call']['name'])
@@ -205,8 +210,9 @@ class ChatGPTSession(CommonChatSession):
             yield r
 
     def _stream_gen_with_tools(self,tools: List[Any],):
-        tools_prompt = {t.__class__.__name__:(t,t.model_dump()) for t in tools}
-        response = self.openai_chat_completion_create(stream=True,tools_prompt=tools_prompt)
+        tools_prompt = {t.get_class_name():(t,t.get_openai_description()) for t in tools}
+        response = self.openai_chat_completion_create(stream=True,
+                                                      tools_prompt=[t[1] for t in tools_prompt.values()])
         for r in self._process_stream_response(response):            
             self._last_receive = r
             if type(r) is tuple and len(r)==2:

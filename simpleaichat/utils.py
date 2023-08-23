@@ -1,5 +1,4 @@
 import os
-import httpx
 from typing import List, Union
 from pydantic import Field
 

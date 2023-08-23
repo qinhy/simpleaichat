@@ -3,16 +3,10 @@ from uuid import uuid4, UUID
 
 from pydantic import BaseModel, SecretStr, HttpUrl, Field
 from typing import List, Dict, Union, Optional, Set, Any
-import orjson
 import csv
 import inspect
 import tiktoken
 import json
-
-
-def orjson_dumps(v, *, default, **kwargs):
-    # orjson.dumps returns bytes, to match standard json.dumps we need to decode
-    return orjson.dumps(v, default=default, **kwargs).decode()
 
 
 def now_tz():
@@ -47,12 +41,14 @@ class Function(BaseModel):
             if param.default is inspect._empty:
                 self.required.append(name)
         self.parameters['properties']=self._properties
+    def get_class_name(self):
+        return self.__class__.__name__
     
+    def get_openai_description(self):
+        return self.model_dump()
+
     def json(self):
         return self.model_dump_json()
-
-
-
 
 class CommonMessage(BaseModel):    
     role: str
@@ -95,14 +91,11 @@ class CommonChatSession(BaseModel):
     model: str
     # system: str
 
-    params: Dict[str, Any] = {}
     system_message: CommonMessage = None
     messages: List[CommonMessage] = []
     last_update: datetime.datetime = Field(default_factory=now_tz)
 
-    input_fields: Set[str] = {}
     recent_messages: int = 0
-    save_messages: Optional[bool] = True
     total_prompt_length: int = 0
     total_completion_length: int = 0
     total_length: int = 0
@@ -113,11 +106,6 @@ class CommonChatSession(BaseModel):
     _token_encoder = None    
     _last_prompt:str = ''
 
-    # def __init__(self, *args,**kwargs):
-    #     super(self.__class__, self).__init__(*args,**kwargs)
-        # if self.system_message is not None and self._token_encoder is not None and self.system_message.content_tokens == 0:
-        #     self.system_message.calc_tokens(self._token_encoder)
-
     def __str__(self) -> str:
         sess_start_str = self.created_at.strftime("%Y-%m-%d %H:%M:%S")
         last_message_str = self.messages[-1].last_update.strftime("%Y-%m-%d %H:%M:%S")
@@ -125,70 +113,60 @@ class CommonChatSession(BaseModel):
         - {len(self.messages):,} Messages
         - Last message sent at {last_message_str}"""
 
-    def format_input_messages(
-        self, system_message: CommonMessage, user_message: CommonMessage
-    ) -> list:
-        model_dump = lambda x:x.model_dump(include=self.input_fields, exclude_none=True)
-        msg = [model_dump(system_message)]
-        msg += [model_dump(m) for m in self.messages[-self.recent_messages:] ]    
-        msg.append(model_dump(user_message))
-        return msg
+    def add_msg(self,m = {'user':'Hello!'}, name=None):
+        try:
+            if type(m) is not CommonMessage:
+                m = CommonMessage.custom_construct_one(m).calc_tokens(self.get_token_encoder())
+        except Exception as e:
+            print(e)
+            return False
+        if name is not None:
+            m.name = name
+        self.messages.append(m)
+        return True
 
-    def calc_tokens(self,msg):
-        if self._token_encoder is not None:
-            return len(self._token_encoder.encode(msg.content))
-        return 0
+    def to_dict(self):
+        return self.model_dump()
+    
+    def load_from_dict(self,d):
+        d = dict(**d)
+        d['system_message'] = CommonMessage(**d['system_message']) if 'system_message' in d.keys() else None
+        d['messages'] = [CommonMessage(**i) for i in d['messages']]
+        return self.model_copy(update=d)
 
-    def add_messages(
-        self,
-        user_message: CommonMessage,
-        assistant_message: CommonMessage,
-        save_messages: bool = None,
-    ) -> None:
-        user_message.calc_tokens(self._token_encoder)
-        assistant_message.calc_tokens(self._token_encoder)
-        # if save_messages is explicitly defined, always use that choice
-        # instead of the default
-        if isinstance(save_messages, bool) and save_messages:
-                self.messages.append(user_message)
-                self.messages.append(assistant_message)
-        elif self.save_messages:
-            self.messages.append(user_message)
-            self.messages.append(assistant_message)
-
-    def save_session(
-        self,
-        output_path: str = None,
-        format: str = "csv",
-        minify: bool = False,
-    ):
-        sess = self
-        sess_dict = sess.model_dump(
-            exclude={"api_url", "input_fields"},
-            exclude_none=True,
-        )
-        output_path = output_path or f"chat_session.{format}"
-        if format == "csv":
-            with open(output_path, "w", encoding="utf-8") as f:
-                fields = [
-                    "role",
-                    "content",
-                    "last_update",
-                    "content_tokens",
-                ]
-                w = csv.DictWriter(f, fieldnames=fields)
-                w.writeheader()
-                for message in sess_dict["messages"]:                    
-                    # datetime must be in common format to be loaded into spreadsheet
-                    # for human-readability, the timezone is set to local machine
-                    local_datetime = message["last_update"].astimezone()
-                    message["last_update"] = local_datetime.strftime("%Y-%m-%d %H:%M:%S")
-                    tmp = {f:message.get(f,None) for f in fields}
-                    w.writerow(tmp)
-        elif format == "json":
-            with open(output_path, "wb") as f:
-                f.write(
-                    orjson.dumps(
-                        sess_dict, option=orjson.OPT_INDENT_2 if not minify else None
-                    )
-                )
+    # def save_session(
+    #     self,
+    #     output_path: str = None,
+    #     format: str = "csv",
+    #     minify: bool = False,
+    # ):
+    #     sess = self
+    #     sess_dict = sess.model_dump(
+    #         exclude={"api_url", "input_fields"},
+    #         exclude_none=True,
+    #     )
+    #     output_path = output_path or f"chat_session.{format}"
+    #     if format == "csv":
+    #         with open(output_path, "w", encoding="utf-8") as f:
+    #             fields = [
+    #                 "role",
+    #                 "content",
+    #                 "last_update",
+    #                 "content_tokens",
+    #             ]
+    #             w = csv.DictWriter(f, fieldnames=fields)
+    #             w.writeheader()
+    #             for message in sess_dict["messages"]:                    
+    #                 # datetime must be in common format to be loaded into spreadsheet
+    #                 # for human-readability, the timezone is set to local machine
+    #                 local_datetime = message["last_update"].astimezone()
+    #                 message["last_update"] = local_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    #                 tmp = {f:message.get(f,None) for f in fields}
+    #                 w.writerow(tmp)
+    #     elif format == "json":
+    #         with open(output_path, "wb") as f:
+    #             f.write(
+    #                 orjson.dumps(
+    #                     sess_dict, option=orjson.OPT_INDENT_2 if not minify else None
+    #                 )
+    #             )
