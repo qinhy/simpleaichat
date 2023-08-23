@@ -3,40 +3,12 @@ from typing import List, Dict, Union, Set, Any
 import os
 from uuid import uuid4, UUID
 import openai
+from tools import * 
 from models import CommonMessage, CommonChatSession, Function
 from utils import remove_a_key
 import json
 from typing import List, Dict, Union, Optional, Set, Any
 import tiktoken
-from utils import wikipedia_search, wikipedia_search_lookup
-
-class WikipediaSearch(Function):
-    description: str = 'search information from wiki and get topics'
-    _parameters_description = dict(
-        query='the key words use for searching'
-    )
-    def __call__(self, query: str):
-        wiki_matches = wikipedia_search(query, n=3)
-        if len(wiki_matches)==0:
-            wiki_matches = ['nothing found!']
-        return {"titles": wiki_matches, "context": ", ".join(wiki_matches), }
-    
-    def __init__(self, *args,**kwargs):
-        super(self.__class__, self).__init__(*args,**kwargs)
-        self._extract_signature()
-
-class WikipediaLookup(Function):
-    description: str = 'lookup more information about a topic.'
-    _parameters_description = dict(
-        query='the key words use for lookup'
-    )
-    def __call__(self, query: str):
-        page = wikipedia_search_lookup(query, sentences=3)
-        return page
-    
-    def __init__(self, *args,**kwargs):
-        super(self.__class__, self).__init__(*args,**kwargs)
-        self._extract_signature()
 
 class PromptFactory:
     @staticmethod
@@ -52,7 +24,7 @@ class PromptFactory:
         return f"You are a helpful {name} who is proficient in both English and Japanese. Please ensure that all your replies are in Japanese, except for computer commands."
 
     @staticmethod
-    def QnA(q,a):
+    def QnAeval(q,a):
         return f'''
 You are an expert who conducts strict evaluations. For the given Question and Answer, determine whether the response is adequate. 
 If it's sufficient, simply only 'OK'.
@@ -64,6 +36,8 @@ Question:
 Answer:
 {a}
 '''
+
+
 
 
 class ChatGPTSession(CommonChatSession):    
@@ -124,14 +98,41 @@ class ChatGPTSession(CommonChatSession):
     
     def _process_response(self,r):
         try:
+            funcname = ''
+            arguments = ''
+            content = ''
             msg = r["choices"][0]["message"]
-            content = msg['content']
-            if "name" in msg.keys():
-                self.gpt_name = msg['name']
-            self.add_msg({msg['role']:content},self.gpt_name)                
-            self.total_prompt_length += r["usage"]["prompt_tokens"]
-            self.total_completion_length += r["usage"]["completion_tokens"]
-            self.total_length += r["usage"]["total_tokens"]
+            if 'function_call' in msg.keys():
+                msg = msg['function_call']
+                if 'name' in msg.keys():
+                    funcname = msg['name']
+                    yield PromptFactory.function_use(self.gpt_name,msg['name'])
+                if 'arguments' in msg.keys():
+                    arguments += msg['arguments']
+                    yield msg['arguments']
+                # yield PromptFactory.function_use(self.gpt_name,msg['function_call']['name'])
+                # func = tools_prompt.get(msg['function_call']['name'],(None,None))[0]
+                # args = json.loads(msg['function_call']['arguments'])
+                # if func is not None:
+                #     res = func(**args)
+                #     yield PromptFactory.function_res(msg['function_call']['name'],args,res)
+                #     self.add_msg({'function':str(res)},msg['function_call']['name'])
+                #     for r in self._gen() :yield r
+            else:
+                content = msg['content']
+                if "name" in msg.keys():
+                    self.gpt_name = msg['name']
+                # self.add_msg({msg['role']:content},self.gpt_name)                
+                self.total_prompt_length += r["usage"]["prompt_tokens"]
+                self.total_completion_length += r["usage"]["completion_tokens"]
+                self.total_length += r["usage"]["total_tokens"]
+
+            if len(content)>0:
+                self.add_msg({self.gpt_role:content},self.gpt_name)
+                yield  content
+            else:
+                yield funcname,arguments
+
         except KeyError:
             raise KeyError(f"No AI generation: {r}")
         return content
@@ -158,7 +159,7 @@ class ChatGPTSession(CommonChatSession):
                         yield content[-1]#{"delta": delta, "response": "".join(content)}
             if len(content)>0:
                 self.add_msg({self.gpt_role:"".join(content)},self.gpt_name)
-                yield  "".join(content)
+                # yield  "".join(content)
             else:
                 yield funcname,arguments
         except KeyError:
@@ -183,24 +184,25 @@ class ChatGPTSession(CommonChatSession):
     def _gen(self,timeout=None):        
         response = self.openai_chat_completion_create(stream=False,timeout=timeout)
         self._last_receive = response    
-        yield self._process_response(response)
+        for r in  self._process_response(response):yield r
     
     
     def _gen_with_tools(self,tools: List[Any],):
         tools_prompt = {t.get_class_name():(t,t.get_openai_description()) for t in tools}
         self._last_receive = response = self.openai_chat_completion_create(stream=False,
-                                                      tools_prompt=[t[1] for t in tools_prompt.values()])
-        msg = response['choices'][0]["message"]
-        if 'function_call' in msg.keys():
-            yield PromptFactory.function_use(self.gpt_name,msg['function_call']['name'])
-            func = tools_prompt.get(msg['function_call']['name'],(None,None))[0]
-            args = json.loads(msg['function_call']['arguments'])
-            if func is not None:
-                res = func(**args)
-                yield PromptFactory.function_res(msg['function_call']['name'],args,res)
-                self.add_msg({'function':str(res)},msg['function_call']['name'])
-                for r in self._gen() :yield r
-        yield  ''
+                                                      tools_description=[t[1] for t in tools_prompt.values()])
+        for r in  self._process_response(response):
+            if type(r) is tuple and len(r)==2:
+                funcname,arguments = r
+                func = tools_prompt.get(funcname,(None,None))[0]
+                args = json.loads(arguments)
+                if func is not None:
+                    res = func(**args)
+                    yield PromptFactory.function_res(funcname,args,res)
+                    self.add_msg({'function':str(res)},funcname)
+                    for r in self._gen() :yield r
+            else:
+                yield r
 
     def _stream_gen(self,timeout=None):
         response = self.openai_chat_completion_create(stream=True,timeout=timeout)
@@ -212,7 +214,7 @@ class ChatGPTSession(CommonChatSession):
     def _stream_gen_with_tools(self,tools: List[Any],):
         tools_prompt = {t.get_class_name():(t,t.get_openai_description()) for t in tools}
         response = self.openai_chat_completion_create(stream=True,
-                                                      tools_prompt=[t[1] for t in tools_prompt.values()])
+                                                      tools_description=[t[1] for t in tools_prompt.values()])
         for r in self._process_stream_response(response):            
             self._last_receive = r
             if type(r) is tuple and len(r)==2:
